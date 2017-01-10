@@ -10,12 +10,19 @@
 
 #include "OVR_CAPI_GL.h"
 #include "OVR_CAPI_Audio.h"
+#include "openvr.h"
 
 #if SDL_MAJOR_VERSION < 2
-FILE *__iob_func() {
-  FILE result[3] = { *stdin,*stdout,*stderr };
-  return result;
+#if defined(__cplusplus)
+extern "C" {
+#endif
+  FILE *__iob_func() {
+    FILE result[3] = { *stdin,*stdout,*stderr };
+    return result;
+  }
+#if defined(__cplusplus)
 }
+#endif
 #endif
 
 extern void VID_Refocus();
@@ -105,6 +112,12 @@ static ovrMirrorTextureDesc mirror_texture_desc;
 static GLuint mirror_fbo = 0;
 static int attempt_to_refocus_retry = 0;
 
+static vr::IVRSystem *m_pHMD = NULL;
+static vr::IVRRenderModels *m_pRenderModels = NULL;
+static char *m_strDriver = NULL;
+static char *m_strDisplay = NULL;
+
+qboolean hasOculusRift = false, hasOpenVR = false;
 
 // Wolfenstein 3D, DOOM and QUAKE use the same coordinate/unit system:
 // 8 foot (96 inch) height wall == 64 units, 1.5 inches per pixel unit
@@ -167,30 +180,32 @@ fbo_t CreateFBO(int width, int height) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, width, height, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
 
-	
-	swap_desc.Type = ovrTexture_2D;
-	swap_desc.ArraySize = 1;
-	swap_desc.Format = OVR_FORMAT_R8G8B8A8_UNORM_SRGB;
-	swap_desc.Width = width;
-	swap_desc.Height = height;
-	swap_desc.MipLevels = 1;
-	swap_desc.SampleCount = 1;
-	swap_desc.StaticImage = ovrFalse;
-	swap_desc.MiscFlags = 0;
-	swap_desc.BindFlags = 0;
+  if (hasOculusRift)
+  {
+    swap_desc.Type = ovrTexture_2D;
+    swap_desc.ArraySize = 1;
+    swap_desc.Format = OVR_FORMAT_R8G8B8A8_UNORM_SRGB;
+    swap_desc.Width = width;
+    swap_desc.Height = height;
+    swap_desc.MipLevels = 1;
+    swap_desc.SampleCount = 1;
+    swap_desc.StaticImage = ovrFalse;
+    swap_desc.MiscFlags = 0;
+    swap_desc.BindFlags = 0;
 
-	ovr_CreateTextureSwapChainGL(session, &swap_desc, &fbo.swap_chain);	
-	ovr_GetTextureSwapChainLength(session, fbo.swap_chain, &swap_chain_length);
-	for( i = 0; i < swap_chain_length; ++i ) {
-		int swap_texture_id = 0;
-		ovr_GetTextureSwapChainBufferGL(session, fbo.swap_chain, i, &swap_texture_id);
+    ovr_CreateTextureSwapChainGL(session, &swap_desc, &fbo.swap_chain);
+    ovr_GetTextureSwapChainLength(session, fbo.swap_chain, &swap_chain_length);
+    for (i = 0; i < swap_chain_length; ++i) {
+      unsigned int swap_texture_id = 0;
+      ovr_GetTextureSwapChainBufferGL(session, fbo.swap_chain, i, &swap_texture_id);
 
-		glBindTexture(GL_TEXTURE_2D, swap_texture_id);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	}
+      glBindTexture(GL_TEXTURE_2D, swap_texture_id);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+  }
 
 	return fbo;
 }
@@ -198,7 +213,8 @@ fbo_t CreateFBO(int width, int height) {
 void DeleteFBO(fbo_t fbo) {
 	glDeleteFramebuffersEXT(1, &fbo.framebuffer);
 	glDeleteTextures(1, &fbo.depth_texture);
-	ovr_DestroyTextureSwapChain(session, fbo.swap_chain);
+  if (hasOculusRift)
+	  ovr_DestroyTextureSwapChain(session, fbo.swap_chain);
 }
 
 void QuatToYawPitchRoll(ovrQuatf q, vec3_t out) {
@@ -270,7 +286,7 @@ static void VR_Deadzone_f (cvar_t *var)
 
 static void VR_Perfhud_f (cvar_t *var)
 {
-	if (vr_initialized)
+	if (hasOculusRift)
 	{
 		ovr_SetInt(session, OVR_PERF_HUD_MODE, (int)vr_perfhud.value);
 	}
@@ -307,11 +323,103 @@ void VR_Init()
 	}
 }
 
-qboolean VR_Enable()
+//-----------------------------------------------------------------------------
+// Purpose: Helper to get a string from a tracked device property and turn it
+//			into a std::string
+//-----------------------------------------------------------------------------
+char * GetTrackedDeviceString(vr::IVRSystem* pHmd, vr::TrackedDeviceIndex_t unDevice,
+  vr::TrackedDeviceProperty prop,
+  vr::TrackedPropertyError* peError = nullptr)
+{
+  uint32_t unRequiredBufferLen =
+    pHmd->GetStringTrackedDeviceProperty(unDevice, prop, nullptr, 0, peError);
+  if (unRequiredBufferLen == 0)
+    return "";
+
+  char* pchBuffer = new char[unRequiredBufferLen];
+  unRequiredBufferLen =
+    pHmd->GetStringTrackedDeviceProperty(unDevice, prop, pchBuffer, unRequiredBufferLen, peError);
+  return pchBuffer;
+  // Warning! Memory leak
+}
+
+qboolean OpenVRInit(void)
+{
+  if (!vr::VR_IsHmdPresent())
+  {
+    Con_Printf("No OpenVR HMD detected.\n");
+    return false;
+  }
+
+  vr::EVRInitError eError = vr::VRInitError_None;
+  m_pHMD = vr::VR_Init(&eError, vr::VRApplication_Scene);
+
+  if (eError != vr::VRInitError_None)
+  {
+    m_pHMD = NULL;
+    Con_Printf("\n Unable to init SteamVR runtime.\n");
+    return false;
+  }
+
+  m_pRenderModels = (vr::IVRRenderModels *)vr::VR_GetGenericInterface(vr::IVRRenderModels_Version, &eError);
+
+  if (!m_pRenderModels)
+  {
+    m_pHMD = NULL;
+    vr::VR_Shutdown();
+
+    Con_Printf(" Unable to get render model interface: %s\n", vr::VR_GetVRInitErrorAsEnglishDescription(eError));
+    return false;
+  }
+
+  if (!vr::VRCompositor())
+  {
+    Con_Printf("Compositor initialization failed. See log file for details\n");
+    return false;
+  }
+
+  hasOpenVR = true;
+
+  vr::VRCompositor()->SetTrackingSpace(vr::TrackingUniverseStanding);
+
+  Con_Printf("Getting driver info\n");
+  m_strDriver = "No Driver";
+  m_strDisplay = "No Display";
+
+  m_strDriver = GetTrackedDeviceString(m_pHMD, vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String);
+  m_strDisplay = GetTrackedDeviceString(m_pHMD, vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_SerialNumber_String);
+
+  uint32_t hmdWidth, hmdHeight;
+  int hmdHz;
+  float officialIPD;
+
+  // get this here so we have a resolution starting point for gl initialization.
+  m_pHMD->GetRecommendedRenderTargetSize(&hmdWidth, &hmdHeight);
+
+  for (int i = 0; i < 2; i++) {
+    eyes[i].index = i;
+    //eyes[i].fbo = CreateFBO(hmdWidth, hmdHeight);
+    //eyes[i].render_desc = ovr_GetRenderDesc(session, (ovrEyeType)i, hmd.DefaultEyeFov[i]);
+    //eyes[i].fov_x = (atan(hmd.DefaultEyeFov[i].LeftTan) + atan(hmd.DefaultEyeFov[i].RightTan)) / M_PI_DIV_180;
+    //eyes[i].fov_y = (atan(hmd.DefaultEyeFov[i].UpTan) + atan(hmd.DefaultEyeFov[i].DownTan)) / M_PI_DIV_180;
+  }
+
+  hmdHz = (int)m_pHMD->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+
+  officialIPD = m_pHMD->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_UserIpdMeters_Float) * 100;
+
+  Con_Printf("Hmd Driver: %s .\n", m_strDriver);
+  Con_Printf("Hmd Display: %s .\n", m_strDisplay);
+  Con_Printf("Hmd HZ %d, width %d, height %d\n", hmdHz, hmdWidth, hmdHeight);
+  Con_Printf("Hmd reported IPD in centimeters = %f \n", officialIPD);
+  return true;
+}
+
+qboolean OculusInit()
 {
 	int i;
 	static ovrGraphicsLuid luid;
-	int mirror_texture_id = 0;
+	unsigned int mirror_texture_id = 0;
 	UINT ovr_audio_id;
 
 	if( ovr_Initialize(NULL) != ovrSuccess ) {
@@ -329,6 +437,7 @@ qboolean VR_Enable()
 		return false;
 	}
 	
+  hasOculusRift = true;
 
 	mirror_texture_desc.Format = OVR_FORMAT_R8G8B8A8_UNORM_SRGB;
 	mirror_texture_desc.Width = glwidth;
@@ -344,7 +453,7 @@ qboolean VR_Enable()
 	glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, 0);
 	
 	hmd = ovr_GetHmdDesc(session);
-	
+
 	for( i = 0; i < 2; i++ ) {
 		ovrSizei size = ovr_GetFovTextureSize(session, (ovrEyeType)i, hmd.DefaultEyeFov[i], 1.0f);
 
@@ -354,8 +463,6 @@ qboolean VR_Enable()
 		eyes[i].fov_x = (atan(hmd.DefaultEyeFov[i].LeftTan) + atan(hmd.DefaultEyeFov[i].RightTan)) / M_PI_DIV_180;
 		eyes[i].fov_y = (atan(hmd.DefaultEyeFov[i].UpTan) + atan(hmd.DefaultEyeFov[i].DownTan)) / M_PI_DIV_180;
 	}
-	
-	wglSwapIntervalEXT(0); // Disable V-Sync
 	
 	// Set the Rift as audio device
 	ovr_GetAudioDeviceOutWaveId(&ovr_audio_id);
@@ -375,11 +482,28 @@ qboolean VR_Enable()
 		}
 	}
 
-	attempt_to_refocus_retry = 900; // Try to refocus our for the first 900 frames :/
-	vr_initialized = true;
 	return true;
 }
 
+qboolean VR_Enable()
+{
+  //if (!OculusInit() && !OpenVRInit())
+  if (!OculusInit())
+  {
+    hasOculusRift = false;
+    hasOpenVR = OpenVRInit();
+    Con_Printf("No HMD detected.\n VR Disabled\n");
+    return false;
+  }
+  hasOculusRift = true;
+  Con_Printf("\n\n HMD Initialized\n");
+
+  wglSwapIntervalEXT(0); // Disable V-Sync
+
+  attempt_to_refocus_retry = 900; // Try to refocus our for the first 900 frames :/
+  vr_initialized = true;
+  return true;
+}
 
 void VR_Shutdown() {
 	VR_Disable();
@@ -388,17 +512,27 @@ void VR_Shutdown() {
 void VR_Disable()
 {
 	int i;
-	if( !vr_initialized )
+	if( !hasOculusRift && !hasOpenVR )
 		return;
 	
 	Cvar_SetQuick(&snd_device, "default");
 
-	for( i = 0; i < 2; i++ ) {
-		DeleteFBO(eyes[i].fbo);
-	}
-	ovr_DestroyMirrorTexture(session, mirror_texture);
-	ovr_Destroy(session);
-	ovr_Shutdown();
+  if (hasOculusRift)
+  {
+    for (i = 0; i < 2; i++) {
+      DeleteFBO(eyes[i].fbo);
+    }
+    ovr_DestroyMirrorTexture(session, mirror_texture);
+    ovr_Destroy(session);
+    ovr_Shutdown();
+    hasOculusRift = false;
+  }
+  if (hasOpenVR)
+  {
+    vr::VR_Shutdown();
+    hasOpenVR = false;
+  }
+  m_pHMD = NULL;
 
 	vr_initialized = false;
 }
@@ -406,7 +540,7 @@ void VR_Disable()
 static void RenderScreenForCurrentEye()
 {
 	int swap_index = 0;
-	int swap_texture_id = 0;
+	unsigned int swap_texture_id = 0;
 
 	// Remember the current glwidht/height; we have to modify it here for each eye
 	int oldglheight = glheight;
@@ -415,9 +549,9 @@ static void RenderScreenForCurrentEye()
 	glwidth = current_eye->fbo.size.width;
 	glheight = current_eye->fbo.size.height;
 
-	
-	ovr_GetTextureSwapChainCurrentIndex(session, current_eye->fbo.swap_chain, &swap_index);
-	ovr_GetTextureSwapChainBufferGL(session, current_eye->fbo.swap_chain, swap_index, &swap_texture_id);
+wwwwwwwws  if (hasOculusRift)
+  {sa&swap_texture_id);
+  }
 
 	// Set up current FBO
 	glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, current_eye->fbo.framebuffer);
@@ -435,7 +569,10 @@ static void RenderScreenForCurrentEye()
 	r_refdef.fov_y = current_eye->fov_y;
 
 	SCR_UpdateScreenContent ();
-	ovr_CommitTextureSwapChain(session, current_eye->fbo.swap_chain);
+  if (hasOculusRift)
+  {
+    ovr_CommitTextureSwapChain(session, current_eye->fbo.swap_chain);
+  }
 
 	
 	// Reset
@@ -473,13 +610,16 @@ void VR_UpdateScreenContent()
 	h = mirror_texture_desc.Height;
 
 	// Get current orientation of the HMD
-	ftiming = ovr_GetPredictedDisplayTime(session, 0);
-	pose_time = ovr_GetTimeInSeconds();
-	hmdState = ovr_GetTrackingState(session, ftiming, false);
+  if (hasOculusRift)
+  {
+    ftiming = ovr_GetPredictedDisplayTime(session, 0);
+    pose_time = ovr_GetTimeInSeconds();
+    hmdState = ovr_GetTrackingState(session, ftiming, false);
 
 
-	// Calculate HMD angles and blend with input angles based on current aim mode
-	QuatToYawPitchRoll(hmdState.HeadPose.ThePose.Orientation, orientation);
+    // Calculate HMD angles and blend with input angles based on current aim mode
+    QuatToYawPitchRoll(hmdState.HeadPose.ThePose.Orientation, orientation);
+  }
 	switch( (int)vr_aimmode.value )
 	{
 		// 1: (Default) Head Aiming; View YAW is mouse+head, PITCH is head
@@ -521,7 +661,7 @@ void VR_UpdateScreenContent()
 				// find difference between view and aim yaw
 				diffYaw = cl.viewangles[YAW] - cl.aimangles[YAW];
 
-				if (abs(diffYaw) > vr_deadzone.value / 2.0f)
+				if (fabs(diffYaw) > vr_deadzone.value / 2.0f)
 				{
 					// apply the difference from each set of angles to the other
 					cl.aimangles[YAW] += diffHMDYaw;
@@ -547,7 +687,10 @@ void VR_UpdateScreenContent()
 	view_offset[0] = eyes[0].render_desc.HmdToEyeOffset;
 	view_offset[1] = eyes[1].render_desc.HmdToEyeOffset;
 
-	ovr_CalcEyePoses(hmdState.HeadPose.ThePose, view_offset, render_pose);
+  if (hasOculusRift)
+  {
+    ovr_CalcEyePoses(hmdState.HeadPose.ThePose, view_offset, render_pose);
+  }
 	eyes[0].pose = render_pose[0];
 	eyes[1].pose = render_pose[1];
 
@@ -559,27 +702,30 @@ void VR_UpdateScreenContent()
 	}
 	
 
-	// Submit the FBOs to OVR
-	viewScaleDesc.HmdSpaceToWorldScaleInMeters = meters_to_units;
-	viewScaleDesc.HmdToEyeOffset[0] = view_offset[0];
-	viewScaleDesc.HmdToEyeOffset[1] = view_offset[1];
+  if (hasOculusRift)
+  {
+    // Submit the FBOs to OVR
+    viewScaleDesc.HmdSpaceToWorldScaleInMeters = meters_to_units;
+    viewScaleDesc.HmdToEyeOffset[0] = view_offset[0];
+    viewScaleDesc.HmdToEyeOffset[1] = view_offset[1];
 
-	ld.Header.Type = ovrLayerType_EyeFov;
-	ld.Header.Flags = ovrLayerFlag_TextureOriginAtBottomLeft;
+    ld.Header.Type = ovrLayerType_EyeFov;
+    ld.Header.Flags = ovrLayerFlag_TextureOriginAtBottomLeft;
 
-	for( i = 0; i < 2; i++ ) {
-		ld.ColorTexture[i] = eyes[i].fbo.swap_chain;
-		ld.Viewport[i].Pos.x = 0;
-		ld.Viewport[i].Pos.y = 0;
-		ld.Viewport[i].Size.w = eyes[i].fbo.size.width;
-		ld.Viewport[i].Size.h = eyes[i].fbo.size.height;
-		ld.Fov[i] = hmd.DefaultEyeFov[i];
-		ld.RenderPose[i] = eyes[i].pose;
-		ld.SensorSampleTime = pose_time;
-	}
+    for (i = 0; i < 2; i++) {
+      ld.ColorTexture[i] = eyes[i].fbo.swap_chain;
+      ld.Viewport[i].Pos.x = 0;
+      ld.Viewport[i].Pos.y = 0;
+      ld.Viewport[i].Size.w = eyes[i].fbo.size.width;
+      ld.Viewport[i].Size.h = eyes[i].fbo.size.height;
+      ld.Fov[i] = hmd.DefaultEyeFov[i];
+      ld.RenderPose[i] = eyes[i].pose;
+      ld.SensorSampleTime = pose_time;
+    }
 
-	layers = &ld.Header;
-	ovr_SubmitFrame(session, 0, &viewScaleDesc, &layers, 1);
+    layers = &ld.Header;
+    ovr_SubmitFrame(session, 0, &viewScaleDesc, &layers, 1);
+  }
 
 	// Blit mirror texture to backbuffer
 	glBindFramebufferEXT(GL_READ_FRAMEBUFFER_EXT, mirror_fbo);
@@ -847,7 +993,10 @@ void VR_ResetOrientation()
 	cl.aimangles[YAW] = cl.viewangles[YAW];	
 	cl.aimangles[PITCH] = cl.viewangles[PITCH];
 	if (vr_enabled.value) {
-		ovr_RecenterTrackingOrigin(session);
+    if (hasOculusRift)
+		  ovr_RecenterTrackingOrigin(session);
+    if (hasOpenVR)
+      m_pHMD->ResetSeatedZeroPose();
 		VectorCopy(cl.aimangles,lastAim);
 	}
 }

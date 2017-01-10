@@ -243,7 +243,7 @@
     <ClCompile Include="..\..\Quake\vr_menu.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Quake\vr.c">
+    <ClCompile Include="..\..\Quake\vr.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
